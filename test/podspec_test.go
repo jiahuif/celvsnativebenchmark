@@ -13,6 +13,8 @@ import (
 	"k8s.io/apiextensions-apiserver/pkg/apiserver/schema"
 	"k8s.io/apiextensions-apiserver/pkg/apiserver/schema/cel"
 	"k8s.io/kube-openapi/pkg/validation/spec"
+	apiscore "k8s.io/kubernetes/pkg/apis/core"
+	"k8s.io/kubernetes/pkg/apis/core/validation"
 	generatedopenapi "k8s.io/kubernetes/pkg/generated/openapi"
 )
 
@@ -48,6 +50,14 @@ func BenchmarkPodSpecWithCEL(b *testing.B) {
 	}
 }
 
+func BenchmarkPodSpecNative(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		errList := validation.ValidatePodSpec(&apiscore.PodSpec{}, nil, nil, validation.PodValidationOptions{})
+		if len(errList) == 0 {
+			b.Errorf("empty errList")
+		}
+	}
+}
 func loadSchema(path string) (*apiextensions.JSONSchemaProps, error) {
 	defs := generatedopenapi.GetOpenAPIDefinitions(func(path string) spec.Ref {
 		// does not matter
