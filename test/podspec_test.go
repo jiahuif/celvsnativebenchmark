@@ -12,6 +12,8 @@ import (
 	v1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apiextensions-apiserver/pkg/apiserver/schema"
 	"k8s.io/apiextensions-apiserver/pkg/apiserver/schema/cel"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/kube-openapi/pkg/common"
 	"k8s.io/kube-openapi/pkg/validation/spec"
 	apiscore "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/apis/core/validation"
@@ -24,7 +26,6 @@ func BenchmarkPodSpecWithCEL(b *testing.B) {
 		b.Fatal(err)
 	}
 
-	stripRefs(podSpecDef)
 	structural, err := schema.NewStructural(podSpecDef)
 
 	if err != nil {
@@ -32,65 +33,90 @@ func BenchmarkPodSpecWithCEL(b *testing.B) {
 	}
 
 	structural.Extensions.XValidations = v1.ValidationRules{
-		v1.ValidationRule{Rule: "self.hostNetwork == false", Message: "nothing"},
+		v1.ValidationRule{Rule: "has(self.containers)", Message: "containers"},
+		v1.ValidationRule{Rule: "has(self.restartPolicy) && (self.restartPolicy == 'Always' || self.restartPolicy == 'OnFailure' || self.restartPolicy == 'Never')", Message: "restartPolicy"},
 	}
 
-	r, err := cel.Compile(structural, true, math.MaxInt64)
-
-	if err != nil {
-		b.Fatal(err)
-	}
+	v := cel.NewValidator(structural, math.MaxInt64)
 
 	for i := 0; i < b.N; i++ {
-		v, e, err := r[0].Program.ContextEval(context.Background(), toUnstructured(&corev1.PodSpec{HostNetwork: true}))
-		if err != nil {
-			b.Errorf("could not eval: %v", err)
+		p := toUnstructured(&corev1.PodSpec{HostNetwork: true, RestartPolicy: corev1.RestartPolicyAlways, Containers: []corev1.Container{}})
+		errs, _ := v.Validate(context.Background(), field.NewPath("root"), structural, p, p, math.MaxInt64)
+		if len(errs) != 0 {
+			b.Errorf("unexpected errors: %v", errs)
 		}
-		_, _ = v, e
 	}
 }
 
 func BenchmarkPodSpecNative(b *testing.B) {
 	for i := 0; i < b.N; i++ {
-		errList := validation.ValidatePodSpec(&apiscore.PodSpec{}, nil, nil, validation.PodValidationOptions{})
+		errList := validation.ValidatePodSpec(&apiscore.PodSpec{RestartPolicy: "+invalid"}, nil, nil, validation.PodValidationOptions{})
 		if len(errList) == 0 {
 			b.Errorf("empty errList")
 		}
 	}
 }
-func loadSchema(path string) (*apiextensions.JSONSchemaProps, error) {
-	defs := generatedopenapi.GetOpenAPIDefinitions(func(path string) spec.Ref {
-		// does not matter
-		return spec.MustCreateRef(path)
-	})
+
+func toJSONSchemaProps(in any) (*apiextensions.JSONSchemaProps, error) {
 	b := new(bytes.Buffer)
-	err := json.NewEncoder(b).Encode(defs[path].Schema)
+	err := json.NewEncoder(b).Encode(in)
 	if err != nil {
 		return nil, err
 	}
+	s := new(v1.JSONSchemaProps)
+	err = json.NewDecoder(b).Decode(s)
 	if err != nil {
 		return nil, err
 	}
-	schema := new(apiextensions.JSONSchemaProps)
-	err = json.NewDecoder(b).Decode(schema)
+	out := new(apiextensions.JSONSchemaProps)
+	err = v1.Convert_v1_JSONSchemaProps_To_apiextensions_JSONSchemaProps(s, out, nil)
 	if err != nil {
 		return nil, err
 	}
-	return schema, nil
+	return out, nil
 }
 
-func stripRefs(s *apiextensions.JSONSchemaProps) {
-	s.Ref = nil
-	if s.Items != nil && s.Items.Schema != nil {
-		stripRefs(s.Items.Schema)
+func loadSchema(path string) (*apiextensions.JSONSchemaProps, error) {
+	defs := generatedopenapi.GetOpenAPIDefinitions(func(path string) spec.Ref {
+		return spec.MustCreateRef(path)
+	})
+	s := defs[path].Schema
+	err := resolveRefs(defs, &s)
+	if err != nil {
+		return nil, err
 	}
+	return toJSONSchemaProps(s)
+}
+
+func resolveRefs(defs map[string]common.OpenAPIDefinition, s *spec.Schema) error {
+	if s.Ref.GetURL() != nil {
+		*s = defs[s.Ref.String()].Schema
+	}
+
+	if s.Items != nil {
+		if s.Items.Schema != nil {
+			err := resolveRefs(defs, s.Items.Schema)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	for n, p := range s.Properties {
+		err := resolveRefs(defs, &p)
+		if err != nil {
+			return err
+		}
+		s.Properties[n] = p
+	}
+
 	if s.AdditionalProperties != nil && s.AdditionalProperties.Schema != nil {
-		stripRefs(s.AdditionalProperties.Schema)
+		err := resolveRefs(defs, s.AdditionalProperties.Schema)
+		if err != nil {
+			return err
+		}
 	}
-	for f, p := range s.Properties {
-		stripRefs(&p)
-		s.Properties[f] = p
-	}
+	return nil
 }
 
 func toUnstructured(whatever any) map[string]interface{} {
@@ -98,5 +124,5 @@ func toUnstructured(whatever any) map[string]interface{} {
 	_ = json.NewEncoder(b).Encode(whatever)
 	res := make(map[string]interface{})
 	_ = json.NewDecoder(b).Decode(&res)
-	return map[string]any{"self": res}
+	return res
 }
