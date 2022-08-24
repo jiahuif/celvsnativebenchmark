@@ -16,6 +16,7 @@ import (
 	"k8s.io/kube-openapi/pkg/common"
 	"k8s.io/kube-openapi/pkg/validation/spec"
 	apiscore "k8s.io/kubernetes/pkg/apis/core"
+	apisv1 "k8s.io/kubernetes/pkg/apis/core/v1"
 	"k8s.io/kubernetes/pkg/apis/core/validation"
 	generatedopenapi "k8s.io/kubernetes/pkg/generated/openapi"
 )
@@ -33,14 +34,14 @@ func BenchmarkPodSpecWithCEL(b *testing.B) {
 	}
 
 	structural.Extensions.XValidations = v1.ValidationRules{
-		v1.ValidationRule{Rule: "has(self.containers)", Message: "containers"},
+		v1.ValidationRule{Rule: "has(self.containers) && self.containers.size() > 0", Message: "containers must not be empty"},
 		v1.ValidationRule{Rule: "has(self.restartPolicy) && (self.restartPolicy == 'Always' || self.restartPolicy == 'OnFailure' || self.restartPolicy == 'Never')", Message: "restartPolicy"},
 	}
 
 	v := cel.NewValidator(structural, math.MaxInt64)
 
 	for i := 0; i < b.N; i++ {
-		p := toUnstructured(&corev1.PodSpec{HostNetwork: true, RestartPolicy: corev1.RestartPolicyAlways, Containers: []corev1.Container{}})
+		p := toUnstructured(examplePodSpec())
 		errs, _ := v.Validate(context.Background(), field.NewPath("root"), structural, p, p, math.MaxInt64)
 		if len(errs) != 0 {
 			b.Errorf("unexpected errors: %v", errs)
@@ -48,11 +49,31 @@ func BenchmarkPodSpecWithCEL(b *testing.B) {
 	}
 }
 
+func examplePodSpec() *corev1.PodSpec {
+	pod := &corev1.Pod{
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:  "foo",
+					Image: "debian",
+				},
+			},
+		},
+	}
+	apisv1.SetObjectDefaults_Pod(pod)
+	return &pod.Spec
+}
+
 func BenchmarkPodSpecNative(b *testing.B) {
 	for i := 0; i < b.N; i++ {
-		errList := validation.ValidatePodSpec(&apiscore.PodSpec{RestartPolicy: "+invalid"}, nil, nil, validation.PodValidationOptions{})
-		if len(errList) == 0 {
-			b.Errorf("empty errList")
+		podSpec := new(apiscore.PodSpec)
+		err := apisv1.Convert_v1_PodSpec_To_core_PodSpec(examplePodSpec(), podSpec, nil)
+		if err != nil {
+			b.Fatal(err)
+		}
+		errList := validation.ValidatePodSpec(podSpec, nil, nil, validation.PodValidationOptions{})
+		if len(errList) != 0 {
+			b.Errorf("received errors: %v", errList)
 		}
 	}
 }
